@@ -49,6 +49,7 @@ async def handle_health_check(request):
     """Responds with 200 OK to keep hosting service health checks active."""
     return web.Response(text="Userbot 2 is running healthy!", status=200)
 
+
 async def start_web_server():
     """Starts a minimal asynchronous HTTP server for port checks."""
     app = web.Application()
@@ -83,14 +84,17 @@ async def self_ping_task():
                 print(f"  [⚠️ KEEP ALIVE ERROR] Failed to ping URL: {e}")
 
 
-def extract_episode_number(text):
+def extract_strict_title_info(text):
     """
-    Extracts the episode number from patterns like:
-    - S02E17 -> 17
-    - S2E17 -> 17
-    - E17 or EP17 -> 17
+    STRICT CHECK:
+    - Requires exact format: Bigg Boss Agnipariksha S02E<digits> or S2E<digits>
+    - Uses strict word boundaries (\b) so 'S02 480p' is NOT misread as Episode 480.
+    
+    Correct Match:
+      - 'Bigg Boss Agnipariksha S02E16 The First Eviction of S02 480p...' -> Episode 16
     """
-    match = re.search(r'(?:S\d+)?(?:E|EP|EPISODE)\s*(\d+)', text, re.IGNORECASE)
+    pattern = r'\bBigg\s+Boss\s+Agnipariksha\s+S(?:0?2)E(\d{1,3})\b'
+    match = re.search(pattern, text, re.IGNORECASE)
     if match:
         return int(match.group(1))
     return None
@@ -175,7 +179,7 @@ async def status_command_handler(event):
         "==================================================\n"
         "  [🤖 USERBOT 2 INITIALIZED] Debug Logging Active\n"
         f"  [⚙️ RUN MODE]: {cfg.RUN_MODE} ({cfg.START_TIME} to {cfg.END_TIME})\n"
-        f"  [🔍 TITLE KEYWORD]: '{cfg.SEARCH_KEYWORD}'\n"
+        "  [🔍 STRICT TITLE PATTERN]: 'Bigg Boss Agnipariksha S02E<digits>'\n"
         f"  [🎥 ALLOWED QUALITIES]: {cfg.ALLOWED_QUALITIES}\n"
         f"  [⏳ MIN DURATION]: > 45 minutes (2700s)\n"
         f"  [📍 LAST PROCESSED ID BOUNDARY]: > {state['last_processed_id']}\n"
@@ -245,8 +249,12 @@ async def target_channel_handler(event):
     file_name = message.file.name if message.file and hasattr(message.file, 'name') and message.file.name else ""
     full_text = f"{message_text} {file_name}"
 
-    # 5. Strict Keyword Check
-    if cfg.SEARCH_KEYWORD.lower() not in full_text.lower():
+    # 5. STRICT TITLE CHECK (Must match 'Bigg Boss Agnipariksha S02E<digits>')
+    detected_ep = extract_strict_title_info(full_text)
+    if detected_ep is None:
+        await log_msg(
+            f"[⚠️ IGNORED - INVALID TITLE] Missing required 'Bigg Boss Agnipariksha S02E<digits>' in title: {full_text[:60]}"
+        )
         return
 
     # 6. Quality Match Check (1080p, 720p, 480p)
@@ -257,16 +265,10 @@ async def target_channel_handler(event):
             break
 
     if not matched_quality:
-        await log_msg(f"[⚠️ IGNORED] Keyword matched, but missing quality tag: {full_text[:50]}...")
+        await log_msg(f"[⚠️ IGNORED - NO QUALITY TAG] Strict title matched, but missing quality tag (1080p/720p/480p): {full_text[:50]}...")
         return
 
-    # 7. Extract Episode Tag (e.g., S02E17 or E17)
-    detected_ep = extract_episode_number(full_text)
-    if detected_ep is None:
-        await log_msg(f"[⚠️ IGNORED - MISSING EPISODE NUMBER] Title contains 'S02E' or invalid tag but lacks episode digit: {full_text[:60]}")
-        return
-
-    # 8. Episode Boundary Check
+    # 7. Episode Boundary Check
     last_ep = state.get("last_processed_episode", 0)
     if detected_ep < last_ep:
         await log_msg(
@@ -319,7 +321,7 @@ async def main():
         "==================================================\n"
         "  [🤖 USERBOT 2 INITIALIZED] Ready on New Host\n"
         f"  [⚙️ RUN MODE]: {cfg.RUN_MODE} ({cfg.START_TIME} to {cfg.END_TIME})\n"
-        f"  [🔍 TITLE KEYWORD]: '{cfg.SEARCH_KEYWORD}'\n"
+        "  [🔍 STRICT TITLE PATTERN]: 'Bigg Boss Agnipariksha S02E<digits>'\n"
         f"  [🎥 ALLOWED QUALITIES]: {cfg.ALLOWED_QUALITIES}\n"
         f"  [⏳ MIN DURATION]: > 45 minutes (2700s)\n"
         f"  [📍 THRESHOLD ID]: > {state['last_processed_id']}\n"
