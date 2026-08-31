@@ -212,7 +212,7 @@ async def auto_clear_memory_task():
 
 
 # ==========================================
-# 3. TARGET CHANNEL MONITORING
+# 3. TARGET CHANNEL MONITORING (FIXED & HARDENED)
 # ==========================================
 @client.on(events.NewMessage(chats=cfg.TARGET_CHANNEL_ID))
 async def target_channel_handler(event):
@@ -241,31 +241,40 @@ async def target_channel_handler(event):
 
     if duration_seconds <= 2700:
         await log_msg(
-            f"[⏱️ IGNORED - SHORT DURATION] Duration: {duration_minutes} mins ({duration_seconds}s). Skipping..."
+            f"[⏱️ IGNORED - SHORT DURATION] Message ID {message.id} Duration: {duration_minutes} mins ({duration_seconds}s). Skipping..."
         )
         return
 
+    # Consolidate Text & File Name
     message_text = message.text or ""
-    file_name = message.file.name if message.file and hasattr(message.file, 'name') and message.file.name else ""
-    full_text = f"{message_text} {file_name}"
+    file_name = ""
+    if message.file and hasattr(message.file, 'name') and message.file.name:
+        file_name = message.file.name
 
-    # 5. STRICT TITLE CHECK (Must match 'Bigg Boss Agnipariksha S02E<digits>')
+    # Clean multi-line spaces
+    full_text = f"{message_text} {file_name}".strip()
+
+    # 5. STRICT TITLE CHECK (Hard Barrier)
+    # If full_text is just "480p", extract_strict_title_info will return None and STOP here.
     detected_ep = extract_strict_title_info(full_text)
     if detected_ep is None:
         await log_msg(
-            f"[⚠️ IGNORED - INVALID TITLE] Missing required 'Bigg Boss Agnipariksha S02E<digits>' in title: {full_text[:60]}"
+            f"[⚠️ IGNORED - INVALID TITLE] Message ID {message.id} does not contain 'Bigg Boss Agnipariksha S02E<digits>'. Text: '{full_text[:60]}'"
         )
         return
 
     # 6. Quality Match Check (1080p, 720p, 480p)
     matched_quality = None
     for q in cfg.ALLOWED_QUALITIES:
-        if q.lower() in full_text.lower():
+        # Strict boundary check for quality to avoid false positives
+        if re.search(r'\b' + re.escape(q) + r'\b', full_text, re.IGNORECASE):
             matched_quality = q
             break
 
     if not matched_quality:
-        await log_msg(f"[⚠️ IGNORED - NO QUALITY TAG] Strict title matched, but missing quality tag (1080p/720p/480p): {full_text[:50]}...")
+        await log_msg(
+            f"[⚠️ IGNORED - NO QUALITY TAG] Strict title matched E{detected_ep:02d}, but missing resolution tag (1080p/720p/480p): {full_text[:50]}..."
+        )
         return
 
     # 7. Episode Boundary Check
