@@ -6,6 +6,7 @@ from datetime import datetime, time, timedelta
 from aiohttp import web, ClientSession
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
 
 # Import credentials and settings from configuser2.py
 import configuser2 as cfg
@@ -143,7 +144,7 @@ client = TelegramClient(
 
 
 async def log_msg(text):
-    """Prints status to terminal, and forwards log to DEBUG_CHANNEL_ID."""
+    """Prints status to terminal, and forwards log to DEBUG_CHANNEL_ID with FloodWait support."""
     print(text)
     if getattr(cfg, 'DEBUG_MODE', False) and getattr(cfg, 'DEBUG_CHANNEL_ID', None):
         try:
@@ -153,6 +154,17 @@ async def log_msg(text):
                 message=formatted_text,
                 parse_mode='html'
             )
+        except FloodWaitError as e:
+            print(f"  [⛔ FLOOD WAIT IN LOG] Pausing debug log for {e.seconds} seconds...")
+            await asyncio.sleep(e.seconds)
+            try:
+                await client.send_message(
+                    entity=cfg.DEBUG_CHANNEL_ID,
+                    message=formatted_text,
+                    parse_mode='html'
+                )
+            except Exception as err:
+                print(f"[⚠️ DEBUG LOG ERROR] Retry failed: {err}")
         except Exception as e:
             print(f"[⚠️ DEBUG LOG ERROR] Failed to send log to debug channel: {e}")
 
@@ -221,7 +233,12 @@ async def status_command_handler(event):
         "=================================================="
         "</code>"
     )
-    await event.reply(status_text, parse_mode='html')
+    try:
+        await event.reply(status_text, parse_mode='html')
+    except FloodWaitError as e:
+        print(f"  [⛔ FLOOD WAIT] /status reply rate limited. Waiting {e.seconds}s...")
+        await asyncio.sleep(e.seconds)
+        await event.reply(status_text, parse_mode='html')
 
 
 # ==========================================
@@ -376,6 +393,18 @@ async def target_channel_handler(event):
         )
 
         await log_msg("  [✅ SENT] Direct video link forwarded to private source channel!\n")
+
+    except FloodWaitError as e:
+        await log_msg(f"  [⛔ FLOOD WAIT] Telegram rate limit hit. Pausing for {e.seconds} seconds...\n")
+        await asyncio.sleep(e.seconds)
+        try:
+            await client.send_message(
+                entity=cfg.PRIVATE_SOURCE_CHANNEL,
+                message=msg_link
+            )
+            await log_msg("  [✅ SENT] Link successfully sent after FloodWait pause!\n")
+        except Exception as retry_err:
+            await log_msg(f"  [💥 ERROR] Failed to send link on retry: {retry_err}\n")
 
     except Exception as e:
         await log_msg(f"  [💥 ERROR] Failed to send link: {e}\n")
