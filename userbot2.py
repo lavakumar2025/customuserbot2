@@ -21,7 +21,8 @@ state = {
         "1080p": "",
         "720p": "",
         "480p": ""
-    }
+    },
+    "sent_combinations": []           # e.g. ["E17_1080p", "E17_720p"] — prevents re-sending duplicate combinations
 }
 
 # Load saved state if available
@@ -100,13 +101,11 @@ def extract_strict_title_info(text):
     """
     STRICT CHECK:
     - Requires exact format: Bigg Boss Agnipariksha S02E<digits> or S2E<digits>
-    - Uses strict word boundaries (\\b) so 'S02 480p' is NOT misread as Episode 480.
-    - Allows space/dot/underscore/dash between words to match real filenames like
-      'Bigg.Boss.Agnipariksha.S02E18.480p...'
-
-    Correct Match:
-      - 'Bigg Boss Agnipariksha S02E18 480p JHS WEB-DL ....mkv' -> Episode 18
+    - Uses strict word boundaries (\b) so 'S02 480p' is NOT misread as Episode 480.
+    - Allows space/dot/underscore/dash between words.
     """
+    if not text:
+        return None
     match = TITLE_PATTERN.search(text)
     if match:
         return int(match.group(1))
@@ -116,9 +115,10 @@ def extract_strict_title_info(text):
 def extract_quality(text):
     """
     Returns the quality tag (e.g. '720p') found in text, using strict word
-    boundaries so '1720p' or 'x480p' style false matches are avoided.
-    Returns None if no allowed quality tag is present.
+    boundaries so false matches are avoided.
     """
+    if not text:
+        return None
     for q in cfg.ALLOWED_QUALITIES:
         if re.search(r'\b' + re.escape(q) + r'\b', text, re.IGNORECASE):
             return q
@@ -188,8 +188,7 @@ def is_video_file(message):
         if mime_type.startswith('video/'):
             return True
         if message.file and hasattr(message.file, 'ext') and message.file.ext:
-            video_extensions = ['.mkv', '.mp4', '.avi', '.mov', '.webm', '.flv', '.m4v']
-            if message.file.ext.lower() in video_extensions:
+            if message.file.ext.lower() in VALID_VIDEO_EXTENSIONS:
                 return True
     return False
 
@@ -244,7 +243,7 @@ async def auto_clear_memory_task():
 
 
 # ==========================================
-# 3. TARGET CHANNEL MONITORING (FIXED & HARDENED)
+# 3. TARGET CHANNEL MONITORING
 # ==========================================
 @client.on(events.NewMessage(chats=cfg.TARGET_CHANNEL_ID))
 async def target_channel_handler(event):
@@ -267,15 +266,18 @@ async def target_channel_handler(event):
     if not is_video_file(message):
         return
 
-    # 4. File Extension Check (extra hard gate — rejects non-video containers
-    #    even if Telegram mis-tags the mime type)
+    # 4. Extract Filename & Caption
     file_name = ""
     if message.file and hasattr(message.file, 'name') and message.file.name:
         file_name = message.file.name
 
-    if not has_valid_video_extension(file_name):
+    file_name_clean = file_name.strip()
+    caption_text = (message.text or "").strip()
+
+    # File Extension Check
+    if not has_valid_video_extension(file_name_clean):
         await log_msg(
-            f"[⚠️ IGNORED - BAD EXTENSION] Message ID {message.id} filename '{file_name}' "
+            f"[⚠️ IGNORED - BAD EXTENSION] Message ID {message.id} filename '{file_name_clean}' "
             f"has no valid video extension. Skipping..."
         )
         return
@@ -290,46 +292,60 @@ async def target_channel_handler(event):
         )
         return
 
-    # Consolidate Text & File Name
-    message_text = message.text or ""
-    full_text = f"{message_text} {file_name}".strip()
-
-    # 6. STRICT TITLE CHECK (Hard Barrier)
-    # If full_text does not contain 'Bigg Boss Agnipariksha S02E<digits>',
-    # extract_strict_title_info returns None and we STOP here.
-    detected_ep = extract_strict_title_info(full_text)
+    # 6. HARD SAFETY BARRIER: STRICT TITLE CHECK ON MEDIA FILENAME ONLY
+    # If the video file itself does not match 'Bigg Boss Agnipariksha S02E<digits>', STOP IMMEDIATELY.
+    detected_ep = extract_strict_title_info(file_name_clean)
     if detected_ep is None:
         await log_msg(
-            f"[⚠️ IGNORED - INVALID TITLE] Message ID {message.id} does not contain "
-            f"'Bigg Boss Agnipariksha S02E<digits>'. Full text: '{full_text[:120]}'"
+            f"[⚠️ IGNORED - INVALID FILE TITLE] Message ID {message.id} media filename does not contain "
+            f"'Bigg Boss Agnipariksha S02E<digits>'. Media Filename: '{file_name_clean[:120]}'"
         )
         return
 
-    # 7. Quality Match Check (1080p, 720p, 480p)
-    matched_quality = extract_quality(full_text)
+    # 7. QUALITY CHECK: Filename first, Caption ONLY as fallback if missing in filename
+    matched_quality = extract_quality(file_name_clean)
+    quality_source = "filename"
+
+    if not matched_quality:
+        matched_quality = extract_quality(caption_text)
+        quality_source = "caption (fallback)"
+
     if not matched_quality:
         await log_msg(
-            f"[⚠️ IGNORED - NO QUALITY TAG] Strict title matched E{detected_ep:02d}, but missing "
-            f"resolution tag (1080p/720p/480p). Full text: '{full_text[:120]}'"
+            f"[⚠️ IGNORED - NO QUALITY TAG] Strict title matched E{detected_ep:02d} in filename, but no "
+            f"resolution tag (1080p/720p/480p) found in filename or caption. "
+            f"Filename: '{file_name_clean[:120]}' | Caption: '{caption_text[:120]}'"
         )
         return
 
-    # 8. Episode Boundary Check
+    # 8. Episode Boundary Check (Based strictly on media filename episode)
     last_ep = state.get("last_processed_episode", 0)
     if detected_ep < last_ep:
         await log_msg(
-            f"[⚠️ IGNORED - OLD EPISODE] Detected E{detected_ep:02d} is lower than last processed E{last_ep:02d}."
+            f"[⚠️ IGNORED - OLD EPISODE] Detected E{detected_ep:02d} (from filename) is lower than "
+            f"last processed E{last_ep:02d}."
         )
         return
 
-    # --- ALL FILTERS PASSED ---
-    # Debug: log the EXACT text that triggered a match, so any future false
-    # positive can be diagnosed immediately from the debug channel history.
+    # 9. Duplicate (Episode + Quality) Safety Lock
+    sent_key = f"E{detected_ep:02d}_{matched_quality}"
+    if sent_key in state.get("sent_combinations", []):
+        await log_msg(
+            f"[⚠️ IGNORED - DUPLICATE] E{detected_ep:02d} {matched_quality} was already sent before. "
+            f"Filename: '{file_name_clean[:120]}'"
+        )
+        return
+
+    # Combined full text view for diagnostic logging
+    full_text_log = f"{caption_text} {file_name_clean}".strip()
+
+    # Log successful title and security match
     await log_msg(
-        f"[🔎 TITLE MATCHED] Message ID {message.id} | Episode E{detected_ep:02d} | "
-        f"Quality {matched_quality} | Full text: '{full_text}'"
+        f"[🔎 TITLE MATCHED] Message ID {message.id} | Episode E{detected_ep:02d} | Quality {matched_quality} (from {quality_source}) | "
+        f"Full text: '{full_text_log}'"
     )
 
+    # --- ALL FILTERS PASSED ---
     PROCESSED_MSG_IDS.add(message.id)
     msg_link = get_message_link(event.chat_id, message.id)
 
@@ -337,6 +353,7 @@ async def target_channel_handler(event):
     state["last_processed_id"] = message.id
     state["last_processed_episode"] = max(last_ep, detected_ep)
     state["links"][matched_quality] = msg_link
+    state.setdefault("sent_combinations", []).append(sent_key)
 
     save_state()
 
@@ -344,8 +361,8 @@ async def target_channel_handler(event):
         "==================================================\n"
         f"  [🎥 VIDEO DETECTED] Processing Message ID: {message.id}\n"
         f"  [⏱️ DURATION]: {duration_minutes} mins ({duration_seconds}s)\n"
-        f"  [🎬 EXTRACTED EPISODE]: E{detected_ep:02d}\n"
-        f"  [📺 QUALITY MATCH]: {matched_quality}\n"
+        f"  [🎬 EXTRACTED EPISODE]: E{detected_ep:02d} (verified from filename)\n"
+        f"  [📺 QUALITY MATCH]: {matched_quality} (source: {quality_source})\n"
         f"  [🔗 LINK]: {msg_link}\n"
         "=================================================="
     )
