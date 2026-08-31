@@ -55,7 +55,7 @@ async def start_web_server():
     app = web.Application()
     app.router.add_get('/', handle_health_check)
     app.router.add_get('/health', handle_health_check)
-    
+
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
@@ -67,13 +67,13 @@ async def start_web_server():
 async def self_ping_task():
     """Pings the app's own URL every 5 minutes to prevent sleep."""
     render_url = os.environ.get("RENDER_EXTERNAL_URL") or getattr(cfg, "RENDER_EXTERNAL_URL", None)
-    
+
     if not render_url:
         print("  [⚠️ KEEP ALIVE] RENDER_EXTERNAL_URL not set. Self-ping inactive.")
         return
 
     print(f"  [⏰ KEEP ALIVE] Initializing self-ping worker for: {render_url}")
-    
+
     async with ClientSession() as session:
         while True:
             await asyncio.sleep(300)  # Ping every 5 minutes
@@ -84,20 +84,52 @@ async def self_ping_task():
                 print(f"  [⚠️ KEEP ALIVE ERROR] Failed to ping URL: {e}")
 
 
+# ==========================================
+# STRICT TITLE + QUALITY EXTRACTION
+# ==========================================
+# Matches: Bigg Boss Agnipariksha S02E<digits>  (allows space, dot, underscore, dash as separators)
+TITLE_PATTERN = re.compile(
+    r'\bBigg[\s._-]+Boss[\s._-]+Agnipariksha[\s._-]+S(?:0?2)E(\d{1,3})\b',
+    re.IGNORECASE
+)
+
+VALID_VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.webm', '.flv', '.m4v')
+
+
 def extract_strict_title_info(text):
     """
     STRICT CHECK:
     - Requires exact format: Bigg Boss Agnipariksha S02E<digits> or S2E<digits>
-    - Uses strict word boundaries (\b) so 'S02 480p' is NOT misread as Episode 480.
-    
+    - Uses strict word boundaries (\\b) so 'S02 480p' is NOT misread as Episode 480.
+    - Allows space/dot/underscore/dash between words to match real filenames like
+      'Bigg.Boss.Agnipariksha.S02E18.480p...'
+
     Correct Match:
-      - 'Bigg Boss Agnipariksha S02E16 The First Eviction of S02 480p...' -> Episode 16
+      - 'Bigg Boss Agnipariksha S02E18 480p JHS WEB-DL ....mkv' -> Episode 18
     """
-    pattern = r'\bBigg\s+Boss\s+Agnipariksha\s+S(?:0?2)E(\d{1,3})\b'
-    match = re.search(pattern, text, re.IGNORECASE)
+    match = TITLE_PATTERN.search(text)
     if match:
         return int(match.group(1))
     return None
+
+
+def extract_quality(text):
+    """
+    Returns the quality tag (e.g. '720p') found in text, using strict word
+    boundaries so '1720p' or 'x480p' style false matches are avoided.
+    Returns None if no allowed quality tag is present.
+    """
+    for q in cfg.ALLOWED_QUALITIES:
+        if re.search(r'\b' + re.escape(q) + r'\b', text, re.IGNORECASE):
+            return q
+    return None
+
+
+def has_valid_video_extension(file_name):
+    """Confirms the filename ends with a known video extension."""
+    if not file_name:
+        return False
+    return file_name.lower().endswith(VALID_VIDEO_EXTENSIONS)
 
 
 # Initialize Telethon client
@@ -235,7 +267,20 @@ async def target_channel_handler(event):
     if not is_video_file(message):
         return
 
-    # 4. Duration Check (> 45 mins / 2700s)
+    # 4. File Extension Check (extra hard gate — rejects non-video containers
+    #    even if Telegram mis-tags the mime type)
+    file_name = ""
+    if message.file and hasattr(message.file, 'name') and message.file.name:
+        file_name = message.file.name
+
+    if not has_valid_video_extension(file_name):
+        await log_msg(
+            f"[⚠️ IGNORED - BAD EXTENSION] Message ID {message.id} filename '{file_name}' "
+            f"has no valid video extension. Skipping..."
+        )
+        return
+
+    # 5. Duration Check (> 45 mins / 2700s)
     duration_seconds = get_video_duration(message)
     duration_minutes = round(duration_seconds / 60, 2)
 
@@ -247,37 +292,29 @@ async def target_channel_handler(event):
 
     # Consolidate Text & File Name
     message_text = message.text or ""
-    file_name = ""
-    if message.file and hasattr(message.file, 'name') and message.file.name:
-        file_name = message.file.name
-
-    # Clean multi-line spaces
     full_text = f"{message_text} {file_name}".strip()
 
-    # 5. STRICT TITLE CHECK (Hard Barrier)
-    # If full_text is just "480p", extract_strict_title_info will return None and STOP here.
+    # 6. STRICT TITLE CHECK (Hard Barrier)
+    # If full_text does not contain 'Bigg Boss Agnipariksha S02E<digits>',
+    # extract_strict_title_info returns None and we STOP here.
     detected_ep = extract_strict_title_info(full_text)
     if detected_ep is None:
         await log_msg(
-            f"[⚠️ IGNORED - INVALID TITLE] Message ID {message.id} does not contain 'Bigg Boss Agnipariksha S02E<digits>'. Text: '{full_text[:60]}'"
+            f"[⚠️ IGNORED - INVALID TITLE] Message ID {message.id} does not contain "
+            f"'Bigg Boss Agnipariksha S02E<digits>'. Full text: '{full_text[:120]}'"
         )
         return
 
-    # 6. Quality Match Check (1080p, 720p, 480p)
-    matched_quality = None
-    for q in cfg.ALLOWED_QUALITIES:
-        # Strict boundary check for quality to avoid false positives
-        if re.search(r'\b' + re.escape(q) + r'\b', full_text, re.IGNORECASE):
-            matched_quality = q
-            break
-
+    # 7. Quality Match Check (1080p, 720p, 480p)
+    matched_quality = extract_quality(full_text)
     if not matched_quality:
         await log_msg(
-            f"[⚠️ IGNORED - NO QUALITY TAG] Strict title matched E{detected_ep:02d}, but missing resolution tag (1080p/720p/480p): {full_text[:50]}..."
+            f"[⚠️ IGNORED - NO QUALITY TAG] Strict title matched E{detected_ep:02d}, but missing "
+            f"resolution tag (1080p/720p/480p). Full text: '{full_text[:120]}'"
         )
         return
 
-    # 7. Episode Boundary Check
+    # 8. Episode Boundary Check
     last_ep = state.get("last_processed_episode", 0)
     if detected_ep < last_ep:
         await log_msg(
@@ -286,6 +323,13 @@ async def target_channel_handler(event):
         return
 
     # --- ALL FILTERS PASSED ---
+    # Debug: log the EXACT text that triggered a match, so any future false
+    # positive can be diagnosed immediately from the debug channel history.
+    await log_msg(
+        f"[🔎 TITLE MATCHED] Message ID {message.id} | Episode E{detected_ep:02d} | "
+        f"Quality {matched_quality} | Full text: '{full_text}'"
+    )
+
     PROCESSED_MSG_IDS.add(message.id)
     msg_link = get_message_link(event.chat_id, message.id)
 
@@ -343,7 +387,7 @@ async def main():
 
     asyncio.create_task(auto_clear_memory_task())
     asyncio.create_task(self_ping_task())
-    
+
     await client.run_until_disconnected()
 
 
