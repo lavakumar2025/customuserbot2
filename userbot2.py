@@ -14,9 +14,8 @@ import configuser2 as cfg
 PROCESSED_MSG_IDS = set()
 STATE_FILE = "userbot2_state.json"
 
-# Updated tracking state structure
-state = {
-    "last_processed_id": 177,
+DEFAULT_STATE = {
+    "last_processed_id": 0,
     "last_processed_episode": 21,
     "check_episode": 21,
     "qualities_status": {
@@ -29,8 +28,11 @@ state = {
         "720p": "",
         "480p": ""
     },
-    "sent_combinations": [] # e.g. ["E21_1080p", "E21_720p"]
+    "sent_combinations": []  # e.g. ["E21_1080p", "E21_720p"]
 }
+
+# Tracking state structure initialized with defaults
+state = json.loads(json.dumps(DEFAULT_STATE))
 
 # Load saved state if available
 if os.path.exists(STATE_FILE):
@@ -92,7 +94,6 @@ async def self_ping_task():
 # ==========================================
 # STRICT TITLE + QUALITY EXTRACTION
 # ==========================================
-# Updated regex pattern to match 'Bigg Boss Agnipariksha S02E21' inside longer filenames
 TITLE_PATTERN = re.compile(
     r'Bigg[\s._-]+Boss[\s._-]+Agnipariksha[\s._-]+S(?:0?2)E(\d{1,3})',
     re.IGNORECASE
@@ -202,7 +203,7 @@ def get_video_duration(message):
 
 
 # ==========================================
-# 1. COMMAND LISTENER: /status in Debug Channel
+# 1. COMMAND LISTENERS: /status & /clear in Debug Channel
 # ==========================================
 @client.on(events.NewMessage(chats=cfg.DEBUG_CHANNEL_ID, pattern=r'^/status$'))
 async def status_command_handler(event):
@@ -216,6 +217,7 @@ async def status_command_handler(event):
         f"  [🎥 QUALITIES STATUS]: {state['qualities_status']}\n"
         f"  [📍 CHECK EPISODE]: E{state.get('check_episode', 0):02d}\n"
         f"  [🎬 LAST PROCESSED EPISODE]: E{state.get('last_processed_episode', 0):02d}\n"
+        f"  [🆔 LAST PROCESSED MSG ID]: {state.get('last_processed_id', 0)}\n"
         f"  [📥 MONITORING CHANNEL]: {cfg.TARGET_CHANNEL_ID}\n"
         f"  [📤 DESTINATION CHANNEL]: {cfg.PRIVATE_SOURCE_CHANNEL}\n"
         "=================================================="
@@ -226,6 +228,37 @@ async def status_command_handler(event):
     except FloodWaitError as e:
         await asyncio.sleep(e.seconds)
         await event.reply(status_text, parse_mode='html')
+
+
+@client.on(events.NewMessage(chats=cfg.DEBUG_CHANNEL_ID, pattern=r'^/clear$'))
+async def clear_command_handler(event):
+    global state, PROCESSED_MSG_IDS
+
+    # Reset in-memory state and processed ID cache
+    state.clear()
+    state.update(json.loads(json.dumps(DEFAULT_STATE)))
+    PROCESSED_MSG_IDS.clear()
+
+    # Save reset state to userbot2_state.json
+    save_state()
+
+    clear_msg = (
+        "<b>[🧹 STATE CLEARED SUCCESSFULLY]</b>\n\n"
+        "<code>"
+        "All state tracking, message history, and quality flags have been reset.\n"
+        "Saved state file userbot2_state.json has been updated.\n\n"
+        f"• Check Episode Reset To: E{state['check_episode']:02d}\n"
+        f"• Last Processed Ep Reset To: E{state['last_processed_episode']:02d}\n"
+        f"• Last Processed Msg ID Reset To: {state['last_processed_id']}\n"
+        f"• Qualities Reset To: {state['qualities_status']}\n"
+        f"• Sent Combinations Reset To: {state['sent_combinations']}"
+        "</code>"
+    )
+    try:
+        await event.reply(clear_msg, parse_mode='html')
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+        await event.reply(clear_msg, parse_mode='html')
 
 
 # ==========================================
@@ -251,15 +284,21 @@ async def auto_clear_memory_task():
 # ==========================================
 @client.on(events.NewMessage(chats=cfg.TARGET_CHANNEL_ID))
 async def target_channel_handler(event):
-    if not is_within_time_window():
-        return
-
     message = event.message
 
-    if message.id <= state["last_processed_id"] or message.id in PROCESSED_MSG_IDS:
+    # Diagnostics log to track every incoming post in monitored channel
+    await log_msg(f"[📩 MESSAGE RECEIVED] ID: {message.id} | Processing filters...")
+
+    if not is_within_time_window():
+        await log_msg(f"[⏰ SKIPPED] Message ID {message.id} received outside scheduled run window.")
+        return
+
+    if message.id in PROCESSED_MSG_IDS:
+        await log_msg(f"[⚠️ SKIPPED] Message ID {message.id} already processed in current session memory.")
         return
 
     if not is_video_file(message):
+        await log_msg(f"[⚠️ SKIPPED] Message ID {message.id} is not a recognized video format or video document.")
         return
 
     file_name = ""
@@ -270,17 +309,20 @@ async def target_channel_handler(event):
     caption_text = (message.text or "").strip()
 
     if not has_valid_video_extension(file_name_clean):
+        await log_msg(f"[⚠️ SKIPPED] Message ID {message.id} file extension not valid: '{file_name_clean}'")
         return
 
     duration_seconds = get_video_duration(message)
+    duration_minutes = round(duration_seconds / 60, 2)
     if duration_seconds <= 2700:
+        await log_msg(f"[⏱️ SKIPPED] Message ID {message.id} duration too short: {duration_minutes}m ({duration_seconds}s). Minimum is 45m.")
         return
 
     # Extract Episode
     detected_ep = extract_strict_title_info(file_name_clean)
     if detected_ep is None:
         await log_msg(
-            f"[⚠️ IGNORED - INVALID FILE TITLE] Message ID {message.id} media filename does not contain "
+            f"[⚠️ SKIPPED - TITLE MISMATCH] Message ID {message.id} media filename does not contain "
             f"'Bigg Boss Agnipariksha S02E<digits>'. Filename: '{file_name_clean[:120]}'"
         )
         return
@@ -288,6 +330,7 @@ async def target_channel_handler(event):
     # Extract Quality
     matched_quality = extract_quality(file_name_clean) or extract_quality(caption_text)
     if not matched_quality:
+        await log_msg(f"[⚠️ SKIPPED - QUALITY MISSING] Message ID {message.id} has no valid quality tag (1080p, 720p, 480p).")
         return
 
     check_ep = state.get("check_episode", state.get("last_processed_episode", 0))
@@ -295,28 +338,26 @@ async def target_channel_handler(event):
 
     # Ignore previous episodes lower than current tracking point
     if detected_ep < check_ep:
-        await log_msg(f"[⚠️ IGNORED - OLD EPISODE] E{detected_ep:02d} is lower than active check episode E{check_ep:02d}.")
+        await log_msg(f"[⚠️ SKIPPED - OLD EPISODE] E{detected_ep:02d} is lower than active check episode E{check_ep:02d}.")
         return
 
     sent_key = f"E{detected_ep:02d}_{matched_quality}"
     if sent_key in state.get("sent_combinations", []):
-        await log_msg(f"[⚠️ IGNORED - DUPLICATE] Combination {sent_key} already sent.")
+        await log_msg(f"[⚠️ SKIPPED - DUPLICATE] Combination {sent_key} was already forwarded.")
         return
 
     # Logical Validation & State Transitions
     if detected_ep == check_ep:
-        # Check if active episode already completed all qualities
         if state["qualities_status"].get(matched_quality, False):
-            await log_msg(f"[⚠️ IGNORED - QUALITY DONE] E{detected_ep:02d} {matched_quality} is already marked complete.")
+            await log_msg(f"[⚠️ SKIPPED - QUALITY ALREADY DONE] E{detected_ep:02d} {matched_quality} is marked complete.")
             return
 
     elif detected_ep > check_ep:
-        # Check if the existing episode was complete before moving ahead
         all_completed = all(state["qualities_status"].values())
         if not all_completed and last_ep == check_ep:
             await log_msg(
-                f"[⚠️ EPISODE SKIPPED/NEW DETECTED] Advanced to E{detected_ep:02d} while E{check_ep:02d} was incomplete. "
-                f"Resetting state tracking to E{detected_ep:02d}."
+                f"[⚠️ EPISODE ADVANCED] Moving to E{detected_ep:02d} while E{check_ep:02d} was incomplete. "
+                f"Resetting quality status to track E{detected_ep:02d}."
             )
 
         # Reset states for the new higher episode
@@ -337,10 +378,10 @@ async def target_channel_handler(event):
 
     # Auto-advance check_episode if current episode has completed all qualities
     if all(state["qualities_status"].values()):
-        await log_msg(f"[🎉 EPISODE COMPLETE] E{detected_ep:02d} has all qualities (1080p, 720p, 480p). Incrementing check_episode.")
+        await log_msg(f"[🎉 EPISODE COMPLETE] E{detected_ep:02d} completed all qualities (1080p, 720p, 480p). Advancing check_episode to E{detected_ep + 1:02d}.")
         state["check_episode"] = detected_ep + 1
         state["qualities_status"] = {"1080p": False, "720p": False, "480p": False}
-        state["links"] = {"1080p": "", "720p": "", "480p": ""}
+        state["links"] = {"1080p": "", "720p": ""}
 
     save_state()
 
